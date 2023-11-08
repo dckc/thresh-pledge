@@ -3,13 +3,14 @@
 /* eslint-disable import/order -- https://github.com/endojs/endo/issues/1235 */
 import { test as anyTest } from './prepare-test-env-ava.js';
 import path from 'path';
-
 import bundleSource from '@endo/bundle-source';
+import { makeZoeKitForTest } from '@agoric/zoe/tools/setup-zoe.js';
+import buildManualTimer from '@agoric/zoe/tools/manualTimer.js';
 
 import { E } from '@endo/far';
 import { makePromiseKit } from '@endo/promise-kit';
-import { makeZoeKitForTest } from '@agoric/zoe/tools/setup-zoe.js';
 import { AmountMath, makeIssuerKit } from '@agoric/ertp';
+import { TimeMath } from '@agoric/time';
 
 import { withAmountUtils } from './supports.js';
 
@@ -27,7 +28,9 @@ const makeTestContext = async (t) => {
   // pack the contract
   const bundle = await bundleSource(contractPath);
   const { zoeService: zoe } = makeZoeKitForTest();
-  return { zoe, bundle };
+
+  const eventLoopIteration = () => new Promise(setImmediate);
+  return { zoe, bundle, eventLoopIteration };
 };
 
 test.before(async (t) => (t.context = await makeTestContext(t)));
@@ -51,7 +54,9 @@ test('zoe - mint payments', async (t) => {
   // Let's get the tokenIssuer from the contract so we can evaluate
   // what we get as our payout
   const publicFacet = E(zoe).getPublicFacet(instance);
-  const tokenIssuer = E(publicFacet).getTokenIssuer();
+  const {
+    issuers: { Tokens: tokenIssuer },
+  } = await E(zoe).getTerms(instance);
   const tokenBrand = await E(tokenIssuer).getBrand();
 
   const tokens1000 = AmountMath.make(tokenBrand, 1000n);
@@ -75,42 +80,61 @@ test('crowdfund', async (t) => {
     publicFacet: makePromiseKit(),
     aliceDonate: makePromiseKit(),
     bobDonate: makePromiseKit(),
+    charlieDonate: makePromiseKit(),
     muchTime: makePromiseKit(),
   };
+  Object.entries(sync).forEach(([name, { promise }]) => {
+    promise.then((r) => console.log('++ SYNC', name, 'resolved to', r));
+  });
 
   const logged = (x) => {
     console.log('@@@', x);
     return x;
   };
 
-  const bella = async () => {
-    const deadline = 'TODO: 14 days';
+  /** @param {ERef<import('@agoric/time/src/types').TimerService>} timerP */
+  const bella = async (timerP, dur = BigInt(14 * DAY), goal = 100_000) => {
     const { creatorFacet, publicFacet } = await E(zoe).startInstance(
       crowdFundInstall,
-      { Donation: money.issuer },
-      {
-        price: money.units(100_000),
-        deadline,
-      },
+      { Money: money.issuer },
     );
     console.log('fund:', { creatorFacet, publicFacet });
     sync.publicFacet.resolve(publicFacet);
 
+    const t0 = await E(timerP).getCurrentTimestamp();
+    const timer = await timerP;
+    const deadline = TimeMath.addAbsRel(
+      t0,
+      TimeMath.relValue(
+        harden({
+          timerBrand: t0.timerBrand,
+          relValue: dur,
+        }),
+      ),
+    );
     const beneficiarySeat = await E(zoe).offer(
       logged(await E(creatorFacet).makeBeneficiaryInvitation()),
+      harden({
+        want: { Money: money.units(goal) },
+        exit: { afterDeadline: { deadline, timer } },
+      }),
     );
     const benefitRight = await E(beneficiarySeat).getOfferResult();
-    await t.throwsAsync(E(benefitRight).claim(), undefined, 'claim early');
+    await t.throwsAsync(E(beneficiarySeat).tryExit(), undefined, 'claim early');
 
     await sync.aliceDonate.promise;
-    await t.throwsAsync(E(benefitRight).claim(), undefined, 'claim early');
+    await t.throwsAsync(E(beneficiarySeat).tryExit(), undefined, 'claim early');
     await sync.bobDonate.promise;
-    await t.throwsAsync(E(benefitRight).claim(), undefined, 'claim early');
+    await t.throwsAsync(E(beneficiarySeat).tryExit(), undefined, 'claim early');
 
     await sync.muchTime.promise;
-    const { benefit } = E.get(E(benefitRight).claim());
+    const benefit = await E(beneficiarySeat).getPayout('Money');
     await t.notThrowsAsync(E(money.issuer).getAmountOf(benefit), 'claim');
-    await t.throwsAsync(benefit.claim(), undefined, 'claim again?');
+    await t.throwsAsync(
+      E(beneficiarySeat).tryExit(),
+      undefined,
+      'claim again?',
+    );
   };
 
   /**
@@ -118,12 +142,12 @@ test('crowdfund', async (t) => {
    * @param {Amount<'nat'>} amt
    */
   const contribute = async (purseP, amt) => {
-    const proposal = { give: { Donation: amt } };
+    const proposal = { give: { Money: amt } };
 
     const seat = await E(zoe).offer(
       await E(sync.publicFacet.promise).makeContributeInvitation(),
       proposal,
-      { Donation: await E(purseP).withdraw(amt) },
+      { Money: await E(purseP).withdraw(amt) },
     );
 
     return seat;
@@ -135,13 +159,14 @@ test('crowdfund', async (t) => {
 
     const aliceSeat = await contribute(purseP, amt);
 
-    sync.aliceDonated.resolve();
+    sync.aliceDonate.resolve(true);
   };
 
   /** @param {ERef<Purse<'nat'>>} purseP */
   const bob = async (purseP, amt = money.units(30_000)) => {
     console.log('Bob contributes 30K');
     const bobSeat = await contribute(purseP, amt);
+    sync.bobDonate.resolve(true);
 
     await sync.muchTime.promise;
     await t.throwsAsync(E(bobSeat).withdraw(), undefined, "bob can't withdraw");
@@ -150,15 +175,21 @@ test('crowdfund', async (t) => {
   const charlie = async (purseP, amt = money.units(50_000)) => {
     console.log('Charlie contributes 50K');
     const charlieSeat = await contribute(purseP, amt);
+    sync.charlieDonate.resolve(true);
   };
 
-  const timer = async (t0) => {
+  const timer = buildManualTimer(t.log, BigInt((2020 - 1970) * 365.25 * DAY), {
+    timeStep: BigInt(DAY),
+    eventLoopIteration: t.context.eventLoopIteration,
+  });
+
+  const doTimer = async () => {
     console.log('15 days pass - TODO');
-    // _registry.setCurrentBlock({
-    //   blockNumber: 123,
-    //   timestamp: now + 15 * DAY,
-    // });
-    sync.muchTime.resolve();
+
+    for (let d = 0; d < 15; d++) {
+      await timer.tick(`day ${d}`);
+    }
+    sync.muchTime.resolve(true);
   };
 
   /** @type {(amount: Amount<'nat'>) => Promise<Purse<'nat'>>} */
@@ -169,10 +200,10 @@ test('crowdfund', async (t) => {
   }
 
   await Promise.all([
-    bella(),
+    bella(timer),
     alice(_faucet(money.units(60_000))),
     bob(_faucet(money.units(30_000))),
     charlie(_faucet(money.units(50_000))),
-    timer((2020 - 1970) * 365.25 * DAY),
+    doTimer(),
   ]);
 });
