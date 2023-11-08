@@ -30,21 +30,21 @@ const start = async (zcf) => {
     return 'Offer completed. You should receive a payment from Zoe';
   };
 
-  const { zcfSeat: escrow } = zcf.makeEmptySeatKit();
+  const pledges = [];
 
-  const contributors = [];
-
-  const contributeHook = async (seat) => {
+  const pledgeHook = async (seat) => {
     const p = seat.getProposal();
-    console.log('contribute', p);
-    zcf.atomicRearrange([[seat, escrow, p.give]]);
-    contributors.push(seat);
-    return 'Thank you for your contribution';
+    // TODO: check for a minimum pledge?
+    console.log('pledge proposal', p);
+
+    pledges.push(seat);
+    return 'Thank you for your pledge';
   };
 
-  const publicFacet = Far('publicFacet', {
-    makeContributeInvitation: () =>
-      zcf.makeInvitation(contributeHook, 'contribute'),
+  const publicFacet = Far('CrowdFund API', {
+    makePledgeInvitation: () =>
+      // TODO: proposalShape
+      zcf.makeInvitation(pledgeHook, 'pledge'),
   });
 
   // TODO: support >1 campaign at a time?
@@ -59,10 +59,29 @@ const start = async (zcf) => {
     console.log('beneficiary', p);
     console.log('TODO: share deadline with potential contributors');
 
+    const logged = (x) => {
+      console.log('???', x);
+      return x;
+    };
+
     const claimHook = (claimSeat) => {
+      const goods = harden({ Product: AmountMath.make(brand, 1n) });
+      const { zcfSeat: escrow } = zcf.makeEmptySeatKit();
+
       beneficiarySeat.exit(true); // revoke cancellation rights
-      zcf.atomicRearrange([escrow, claimSeat, escrow.getCurrentAllocation()]);
+
+      pledges.forEach((pSeat) => {
+        const pp = pSeat.getProposal();
+        const gains = zcfMint.mintGains(goods);
+        zcf.atomicRearrange([
+          [pSeat, escrow, logged(pp.give)],
+          [gains, pSeat, goods],
+        ]);
+      });
+
+      zcf.atomicRearrange([[escrow, claimSeat, escrow.getCurrentAllocation()]]);
       claimSeat.exit();
+      return harden({ pledges: pledges.length });
     };
 
     return Far('BenefitRight', {
@@ -70,7 +89,7 @@ const start = async (zcf) => {
     });
   };
 
-  const creatorFacet = Far('creatorFacet', {
+  const creatorFacet = Far('CrowdFund Admin', {
     makeBeneficiaryInvitation: () =>
       zcf.makeInvitation(beneficiaryHook, 'beneficiary'),
     // The creator of the instance can send invitations to anyone
