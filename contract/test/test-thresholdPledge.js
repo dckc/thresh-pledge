@@ -19,7 +19,7 @@ const DAY = 24 * 60 * 60 * 1000;
 const filename = new URL(import.meta.url).pathname;
 const dirname = path.dirname(filename);
 
-const contractPath = `${dirname}/../src/contract.js`;
+const contractPath = `${dirname}/../src/thresholdPledge.js`;
 
 /** @type {import('ava').TestFn<Awaited<ReturnType<makeTestContext>>>} */
 const test = anyTest;
